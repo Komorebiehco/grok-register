@@ -13,8 +13,10 @@ import string
 import threading
 import time
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
+from playwright.sync_api import TimeoutError as BrowserNavigationTimeout
 
 from backend.automation.session import (
     active_browser,
@@ -29,6 +31,7 @@ from backend.automation.session import (
 )
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+SIGNUP_NAVIGATION_TIMEOUT_MS = 30_000
 
 
 class AccountAlreadyRegistered(Exception):
@@ -445,18 +448,31 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         except Exception:
             page_obj = browser_obj.new_tab()
         set_browser_session(browser_obj, page_obj)
-        page_obj.get(SIGNUP_URL)
-        page_obj.wait.doc_loaded()
+        # 页面入口另行检查，不等待图片和 iframe 等资源触发 load。
+        page_obj.get(
+            SIGNUP_URL,
+            wait_until="domcontentloaded",
+            timeout=SIGNUP_NAVIGATION_TIMEOUT_MS,
+        )
+        raise_if_cancelled(cancel_callback)
         # 确认真的进了注册域；about:blank / 错页直接失败
         current = str(getattr(page_obj, "url", "") or "")
-        if "accounts.x.ai" not in current and "x.ai" not in current:
-            raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
+        parsed = urlsplit(current)
+        if parsed.scheme != "https" or parsed.hostname not in {"accounts.x.ai", "x.ai"}:
+            raise Exception("打开注册页失败：未到达预期的 HTTPS 注册域")
 
     try:
         _navigate_signup()
     except Exception as e:
+        raise_if_cancelled(cancel_callback)
         if log_callback:
-            log_callback(f"[Debug] 打开URL异常: {e}")
+            if isinstance(e, BrowserNavigationTimeout):
+                log_callback(
+                    "[警告] 注册页加载超时：30 秒内未等到 DOMContentLoaded；"
+                    "不是 URL 格式错误。请检查代理连接和实例资源，将重试一次。"
+                )
+            else:
+                log_callback(f"[Debug] 打开注册页异常: {e}")
         try:
             restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
             _navigate_signup()
@@ -466,9 +482,15 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                 stop_browser()
             except Exception:
                 pass
+            raise_if_cancelled(cancel_callback)
+            if isinstance(e2, BrowserNavigationTimeout):
+                raise Exception(
+                    "注册页加载超时：重试后仍未在 30 秒内等到 DOMContentLoaded，"
+                    "请检查代理连接和实例资源"
+                ) from e2
             raise Exception(f"打开注册页失败: {e2}") from e2
 
-    # 页面已 doc_loaded，短等即可；过长 sleep 会造成「进页卡顿」
+    # DOM 已加载，后续仍须通过入口元素就绪检查。
     sleep_with_cancel(0.4, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {active_page().url if active_page() else ''}")
